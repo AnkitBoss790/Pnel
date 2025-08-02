@@ -1,5 +1,6 @@
 import discord
 from discord import app_commands
+from discord.ui import Select, View
 import aiohttp
 import os
 from dotenv import load_dotenv
@@ -9,7 +10,14 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Load environment variables (optional override)
 load_dotenv()
+
+# Configuration (hardcoded defaults, override with .env)
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', 'your-discord-bot-token-here')
+PTERODACTYL_URL = os.getenv('PTERODACTYL_URL', 'https://panel.example.com')
+PTERODACTYL_API_KEY = os.getenv('PTERODACTYL_API_KEY', 'your-pterodactyl-api-key-here')
+ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', 'your-discord-admin-role-id-here'))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -20,9 +28,9 @@ tree = app_commands.CommandTree(bot)
 
 class PterodactylBot:
     def __init__(self):
-        self.ptero_url = os.getenv('PTERODACTYL_URL')
-        self.api_key = os.getenv('PTERODACTYL_API_KEY')
-        self.admin_role_id = int(os.getenv('ADMIN_ROLE_ID'))
+        self.ptero_url = PTERODACTYL_URL
+        self.api_key = PTERODACTYL_API_KEY
+        self.admin_role_id = ADMIN_ROLE_ID
 
     async def check_admin(self, interaction: discord.Interaction) -> bool:
         if any(role.id == self.admin_role_id for role in interaction.user.roles):
@@ -39,14 +47,28 @@ class PterodactylBot:
 
 ptero = PterodactylBot()
 
-@bot.event
-async def on_ready():
-    logger.info(f'Logged in as {bot.user}')
-    try:
-        synced = await tree.sync()
-        logger.info(f'Synced {len(synced)} command(s)')
-    except Exception as e:
-        logger.error(f'Failed to sync commands: {str(e)}')
+# Dynamic Nest and Egg Selection for /CreateServer
+class NestEggSelect(Select):
+    def __init__(self, nests, eggs):
+        self.nests = nests
+        self.eggs = eggs
+        options = [discord.SelectOption(label=n['attributes']['name'], value=n['attributes']['id']) for n in nests]
+        super().__init__(placeholder="Select a nest", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        nest_id = int(self.values[0])
+        egg_options = [discord.SelectOption(label=e['attributes']['name'], value=e['attributes']['id']) for e in self.eggs.get(nest_id, [])]
+        self.view.egg_select.options = egg_options
+        self.view.nest_id = nest_id
+        await interaction.response.edit_message(view=self.view)
+
+class EggSelect(Select):
+    def __init__(self):
+        super().__init__(placeholder="Select an egg (after choosing nest)", min_values=1, max_values=1, options=[])
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.egg_id = int(self.values[0])
+        await interaction.response.defer()
 
 @tree.command(name="createserver", description="Create a new server in Pterodactyl")
 @app_commands.describe(
@@ -54,51 +76,62 @@ async def on_ready():
     owneremail="Email of the server owner",
     cpu="CPU limit in percentage (e.g., 200 for 2 cores)",
     memory="Memory limit in MB (e.g., 4096 for 4GB)",
-    disk="Disk space in MB (e.g., 10240 for 10GB)",
-    nest="Nest to select (e.g., Minecraft)",
-    egg="Egg to select (e.g., Paper)"
+    disk="Disk space in MB (e.g., 10240 for 10GB)"
 )
-async def createserver(interaction: discord.Interaction, servername: str, owneremail: str, cpu: int, memory: int, disk: int, nest: str, egg: str):
+async def createserver(interaction: discord.Interaction, servername: str, owneremail: str, cpu: int, memory: int, disk: int):
     if not await ptero.check_admin(interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
         try:
-            # Find user by email
-            async with session.get(f'{ptero.ptero_url}/api/application/users?filter[email]={owneremail}', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200 or not (data := await resp.json())['data']:
-                    return await interaction.followup.send(f"No user found with email {owneremail}.", ephemeral=True)
-                user_id = data['data'][0]['attributes']['id']
-
-            # Find nest
+            # Fetch nests
             async with session.get(f'{ptero.ptero_url}/api/application/nests', headers=await ptero.get_headers()) as resp:
                 if resp.status != 200:
                     return await interaction.followup.send("Failed to fetch nests.", ephemeral=True)
                 nests = (await resp.json())['data']
-                nest_data = next((n for n in nests if n['attributes']['name'].lower() == nest.lower()), None)
-                if not nest_data:
-                    return await interaction.followup.send(f"Nest {nest} not found.", ephemeral=True)
-                nest_id = nest_data['attributes']['id']
 
-            # Find egg
-            async with session.get(f'{ptero.ptero_url}/api/application/nests/{nest_id}/eggs', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch eggs.", ephemeral=True)
-                eggs = (await resp.json())['data']
-                egg_data = next((e for e in eggs if e['attributes']['name'].lower().startswith(egg.lower())), None)
-                if not egg_data:
-                    return await interaction.followup.send(f"Egg {egg} not found in nest {nest}.", ephemeral=True)
-                egg_id = egg_data['attributes']['id']
+            # Fetch eggs for all nests
+            eggs = {}
+            for nest in nests:
+                nest_id = nest['attributes']['id']
+                async with session.get(f'{ptero.ptero_url}/api/application/nests/{nest_id}/eggs', headers=await ptero.get_headers()) as egg_resp:
+                    if egg_resp.status == 200:
+                        eggs[nest_id] = (await egg_resp.json())['data']
+
+            # Create select menus
+            nest_select = NestEggSelect(nests, eggs)
+            egg_select = EggSelect()
+            view = View()
+            view.add_item(nest_select)
+            view.add_item(egg_select)
+            view.nest_id = None
+            view.egg_id = None
+
+            # Send initial message with selects
+            msg = await interaction.followup.send("Select a nest and egg to proceed:", view=view, ephemeral=True)
+
+            # Wait for user selection (simplified, could use a more robust timeout/check)
+            while view.nest_id is None or view.egg_id is None:
+                await discord.utils.sleep(1)
+
+            nest_id = view.nest_id
+            egg_id = view.egg_id
+
+            # Find user by email
+            async with session.get(f'{ptero.ptero_url}/api/application/users?filter[email]={owneremail}', headers=await ptero.get_headers()) as resp:
+                if resp.status != 200 or not (data := await resp.json())['data']:
+                    return await interaction.edit_original_response(content=f"No user found with email {owneremail}.", view=None)
+                user_id = data['data'][0]['attributes']['id']
 
             # Find allocation
             async with session.get(f'{ptero.ptero_url}/api/application/nodes/1/allocations', headers=await ptero.get_headers()) as resp:
                 if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch allocations.", ephemeral=True)
+                    return await interaction.edit_original_response(content="Failed to fetch allocations.", view=None)
                 allocations = (await resp.json())['data']
                 allocation = next((a for a in allocations if not a['attributes']['assigned']), None)
                 if not allocation:
-                    return await interaction.followup.send("No available allocations.", ephemeral=True)
+                    return await interaction.edit_original_response(content="No available allocations.", view=None)
                 allocation_id = allocation['attributes']['id']
 
             # Create server
@@ -106,21 +139,21 @@ async def createserver(interaction: discord.Interaction, servername: str, ownere
                 "name": servername,
                 "user": user_id,
                 "egg": egg_id,
-                "docker_image": "quay.io/pterodactyl/core:java" if nest.lower() == "minecraft" else "quay.io/pterodactyl/core:generic",
-                "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar server.jar" if nest.lower() == "minecraft" else "{{STARTUP}}",
-                "environment": {"SERVER_JARFILE": "server.jar", "MINECRAFT_VERSION": "1.21.1"} if nest.lower() == "minecraft" else {},
+                "docker_image": "quay.io/pterodactyl/core:java",
+                "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar server.jar",
+                "environment": {"SERVER_JARFILE": "server.jar", "MINECRAFT_VERSION": "1.21.1"},
                 "limits": {"memory": memory, "swap": 0, "disk": disk, "io": 500, "cpu": cpu},
                 "feature_limits": {"databases": 0, "backups": 1},
                 "allocation": {"default": allocation_id}
             }
             async with session.post(f'{ptero.ptero_url}/api/application/servers', json=payload, headers=await ptero.get_headers()) as resp:
                 if resp.status == 201:
-                    await interaction.followup.send(f"Server '{servername}' created for {owneremail}!", ephemeral=True)
+                    await interaction.edit_original_response(content=f"Server '{servername}' created for {owneremail}!", view=None)
                 else:
-                    await interaction.followup.send(f"Failed to create server: {(await resp.json()).get('errors', 'Unknown error')}", ephemeral=True)
+                    await interaction.edit_original_response(content=f"Failed to create server: {(await resp.json()).get('errors', 'Unknown error')}", view=None)
         except Exception as e:
             logger.error(f"Error in createserver: {str(e)}")
-            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
+            await interaction.edit_original_response(content=f"Error: {str(e)}", view=None)
 
 @tree.command(name="removeserver", description="Delete a server by ID")
 @app_commands.describe(serverid="Server ID to delete")
@@ -333,11 +366,25 @@ async def addadmin_bot(interaction: discord.Interaction, userid: str):
     await interaction.response.defer(ephemeral=True)
     try:
         user = await bot.fetch_user(int(userid))
-        role = interaction.guild.get_role(ptero.admin_role_id)
-        await user.add_roles(role)
-        await interaction.followup.send(f"User {user.name} added as bot admin!", ephemeral=True)
+        role = discord.utils.get(interaction.guild.roles, id=ptero.admin_role_id)
+        if role:
+            await user.add_roles(role)
+            await interaction.followup.send(f"User {user.name} added as bot admin!", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Admin role ID {ptero.admin_role_id} not found.", ephemeral=True)
     except Exception as e:
         logger.error(f"Error in addadmin_bot: {str(e)}")
         await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
 
-bot.run(os.getenv('DISCORD_TOKEN'))
+@bot.event
+async def on_ready():
+    logger.info(f'Logged in as {bot.user}')
+    try:
+        synced = await tree.sync()
+        logger.info(f'Synced {len(synced)} command(s)')
+        if not synced:
+            logger.warning('No commands synced. Check configuration or permissions.')
+    except Exception as e:
+        logger.error(f'Failed to sync commands: {str(e)}')
+
+bot.run(DISCORD_TOKEN)
