@@ -1,390 +1,445 @@
-import discord
-from discord import app_commands
-from discord.ui import Select, View
-import aiohttp
+# v2.py
 import os
+import discord
+from discord import app_commands, Interaction, ui
+from discord.ext import commands
+import httpx
+import json
+import asyncio
+from typing import Optional
 from dotenv import load_dotenv
-import logging
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Load environment variables (optional override)
+# Load environment (you can instead hardcode or read from a config file)
 load_dotenv()
+DISCORD_TOKEN = "DISCORD_TOKEN"  # Discord bot token
+PTERO_API_KEY = os.getenv("PTERO_API_KEY")  # Pterodactyl Application API key
+PTERO_BASE = "https://dragoncloud.godanime.net" # Panel base URL
 
-# Configuration (hardcoded defaults, override with .env)
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', 'your-discord-bot-token-here')
-PTERODACTYL_URL = os.getenv('PTERODACTYL_URL', 'https://panel.example.com')
-PTERODACTYL_API_KEY = os.getenv('PTERODACTYL_API_KEY', 'your-pterodactyl-api-key-here')
-ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', 'your-discord-admin-role-id-here'))
+ADMIN_WHITELIST_FILE = "admin_whitelist.txt"
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+# HTTP headers for Pterodactyl Application API
+DEFAULT_HEADERS = {
+    "Authorization": f"Bearer {PTERO_API_KEY}",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
 
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
-
-class PterodactylBot:
-    def __init__(self):
-        self.ptero_url = PTERODACTYL_URL
-        self.api_key = PTERODACTYL_API_KEY
-        self.admin_role_id = ADMIN_ROLE_ID
-
-    async def check_admin(self, interaction: discord.Interaction) -> bool:
-        if any(role.id == self.admin_role_id for role in interaction.user.roles):
-            return True
-        await interaction.response.send_message("Only admins can use this command!", ephemeral=True)
+# Helper: admin persistence
+def is_admin_raw(user_id: int) -> bool:
+    if not os.path.isfile(ADMIN_WHITELIST_FILE):
         return False
+    with open(ADMIN_WHITELIST_FILE, "r") as f:
+        return str(user_id) in {line.strip() for line in f if line.strip()}
 
-    async def get_headers(self):
-        return {
-            'Authorization': f'Bearer {self.api_key}',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        }
+def add_admin_raw(user_id: int) -> bool:
+    existing = set()
+    if os.path.isfile(ADMIN_WHITELIST_FILE):
+        with open(ADMIN_WHITELIST_FILE, "r") as f:
+            existing = {line.strip() for line in f if line.strip()}
+    if str(user_id) in existing:
+        return False
+    with open(ADMIN_WHITELIST_FILE, "a") as f:
+        f.write(f"{user_id}\n")
+    return True
 
-ptero = PterodactylBot()
+# Async Pterodactyl Application API wrapper
+async def ptero_request(method: str, path: str, json_body=None):
+    url = f"{PTERO_BASE}/api/application{path}"
+    async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        resp = await client.request(method, url, headers=DEFAULT_HEADERS, json=json_body)
+        resp.raise_for_status()
+        return resp.json()
 
-# Dynamic Nest and Egg Selection for /CreateServer
-class NestEggSelect(Select):
-    def __init__(self, nests, eggs):
-        self.nests = nests
-        self.eggs = eggs
-        options = [discord.SelectOption(label=n['attributes']['name'], value=n['attributes']['id']) for n in nests]
-        super().__init__(placeholder="Select a nest", min_values=1, max_values=1, options=options)
+def format_resources(server_attr: dict) -> str:
+    limits = server_attr.get("limits", {})
+    usage = server_attr.get("resources", {})
+    # memory_bytes may not be present; some panels report differently—adjust if needed.
+    ram_used = usage.get("memory_bytes", 0) / (1024 ** 3) if usage.get("memory_bytes") else 0
+    ram_limit = limits.get("memory", 0) / 1024  # memory is in MB
+    disk_used = usage.get("disk_bytes", 0) / (1024 ** 3) if usage.get("disk_bytes") else 0
+    disk_limit = limits.get("disk", 0) / 1024
+    cpu_percent = usage.get("cpu_absolute", 0)
+    return (f"RAM: {ram_used:.2f}GB/{ram_limit:.2f}GB • "
+            f"CPU: {cpu_percent:.1f}% • "
+            f"Disk: {disk_used:.2f}GB/{disk_limit:.2f}GB")
 
-    async def callback(self, interaction: discord.Interaction):
-        nest_id = int(self.values[0])
-        egg_options = [discord.SelectOption(label=e['attributes']['name'], value=e['attributes']['id']) for e in self.eggs.get(nest_id, [])]
-        self.view.egg_select.options = egg_options
-        self.view.nest_id = nest_id
-        await interaction.response.edit_message(view=self.view)
+# Discord bot setup (hybrid: prefix + slash)
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="/", intents=intents, help_command=commands.MinimalHelpCommand())
+tree = bot.tree  # alias
 
-class EggSelect(Select):
-    def __init__(self):
-        super().__init__(placeholder="Select an egg (after choosing nest)", min_values=1, max_values=1, options=[])
+# Admin check decorator for commands.py style
+def admin_check(ctx):
+    return is_admin_raw(ctx.author.id)
 
-    async def callback(self, interaction: discord.Interaction):
-        self.view.egg_id = int(self.values[0])
-        await interaction.response.defer()
-
-@tree.command(name="createserver", description="Create a new server in Pterodactyl")
-@app_commands.describe(
-    servername="Name of the server",
-    owneremail="Email of the server owner",
-    cpu="CPU limit in percentage (e.g., 200 for 2 cores)",
-    memory="Memory limit in MB (e.g., 4096 for 4GB)",
-    disk="Disk space in MB (e.g., 10240 for 10GB)"
-)
-async def createserver(interaction: discord.Interaction, servername: str, owneremail: str, cpu: int, memory: int, disk: int):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Fetch nests
-            async with session.get(f'{ptero.ptero_url}/api/application/nests', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch nests.", ephemeral=True)
-                nests = (await resp.json())['data']
-
-            # Fetch eggs for all nests
-            eggs = {}
-            for nest in nests:
-                nest_id = nest['attributes']['id']
-                async with session.get(f'{ptero.ptero_url}/api/application/nests/{nest_id}/eggs', headers=await ptero.get_headers()) as egg_resp:
-                    if egg_resp.status == 200:
-                        eggs[nest_id] = (await egg_resp.json())['data']
-
-            # Create select menus
-            nest_select = NestEggSelect(nests, eggs)
-            egg_select = EggSelect()
-            view = View()
-            view.add_item(nest_select)
-            view.add_item(egg_select)
-            view.nest_id = None
-            view.egg_id = None
-
-            # Send initial message with selects
-            msg = await interaction.followup.send("Select a nest and egg to proceed:", view=view, ephemeral=True)
-
-            # Wait for user selection (simplified, could use a more robust timeout/check)
-            while view.nest_id is None or view.egg_id is None:
-                await discord.utils.sleep(1)
-
-            nest_id = view.nest_id
-            egg_id = view.egg_id
-
-            # Find user by email
-            async with session.get(f'{ptero.ptero_url}/api/application/users?filter[email]={owneremail}', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200 or not (data := await resp.json())['data']:
-                    return await interaction.edit_original_response(content=f"No user found with email {owneremail}.", view=None)
-                user_id = data['data'][0]['attributes']['id']
-
-            # Find allocation
-            async with session.get(f'{ptero.ptero_url}/api/application/nodes/1/allocations', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200:
-                    return await interaction.edit_original_response(content="Failed to fetch allocations.", view=None)
-                allocations = (await resp.json())['data']
-                allocation = next((a for a in allocations if not a['attributes']['assigned']), None)
-                if not allocation:
-                    return await interaction.edit_original_response(content="No available allocations.", view=None)
-                allocation_id = allocation['attributes']['id']
-
-            # Create server
-            payload = {
-                "name": servername,
-                "user": user_id,
-                "egg": egg_id,
-                "docker_image": "quay.io/pterodactyl/core:java",
-                "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar server.jar",
-                "environment": {"SERVER_JARFILE": "server.jar", "MINECRAFT_VERSION": "1.21.1"},
-                "limits": {"memory": memory, "swap": 0, "disk": disk, "io": 500, "cpu": cpu},
-                "feature_limits": {"databases": 0, "backups": 1},
-                "allocation": {"default": allocation_id}
-            }
-            async with session.post(f'{ptero.ptero_url}/api/application/servers', json=payload, headers=await ptero.get_headers()) as resp:
-                if resp.status == 201:
-                    await interaction.edit_original_response(content=f"Server '{servername}' created for {owneremail}!", view=None)
-                else:
-                    await interaction.edit_original_response(content=f"Failed to create server: {(await resp.json()).get('errors', 'Unknown error')}", view=None)
-        except Exception as e:
-            logger.error(f"Error in createserver: {str(e)}")
-            await interaction.edit_original_response(content=f"Error: {str(e)}", view=None)
-
-@tree.command(name="removeserver", description="Delete a server by ID")
-@app_commands.describe(serverid="Server ID to delete")
-async def removeserver(interaction: discord.Interaction, serverid: int):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.delete(f'{ptero.ptero_url}/api/application/servers/{serverid}', headers=await ptero.get_headers()) as resp:
-                if resp.status == 204:
-                    await interaction.followup.send(f"Server ID {serverid} deleted successfully!", ephemeral=True)
-                else:
-                    await interaction.followup.send(f"Failed to delete server: {(await resp.json()).get('errors', 'Unknown error')}", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in removeserver: {str(e)}")
-            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
-
-@tree.command(name="checkserverlist", description="List all servers")
-async def checkserverlist(interaction: discord.Interaction):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f'{ptero.ptero_url}/api/application/servers', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch server list.", ephemeral=True)
-                servers = (await resp.json())['data']
-                embed = discord.Embed(title="Server List", color=discord.Color.blue())
-                for server in servers[:25]:  # Limit to 25 to avoid embed size issues
-                    attrs = server['attributes']
-                    embed.add_field(
-                        name=attrs['name'],
-                        value=f"ID: {attrs['id']}\nOwner: {attrs['user']}\nStatus: {'Running' if not attrs['is_suspended'] else 'Suspended'}",
-                        inline=False
-                    )
-                await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in checkserverlist: {str(e)}")
-            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
-
-@tree.command(name="createacc", description="Create a Pterodactyl user account")
-@app_commands.describe(userid="Discord User ID", email="User email", password="User password")
-async def createacc(interaction: discord.Interaction, userid: str, email: str, password: str):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    async with aiohttp.ClientSession() as session:
-        try:
-            payload = {
-                "username": f"user_{userid}",
-                "email": email,
-                "first_name": "User",
-                "last_name": userid,
-                "password": password
-            }
-            async with session.post(f'{ptero.ptero_url}/api/application/users', json=payload, headers=await ptero.get_headers()) as resp:
-                if resp.status == 201:
-                    user = await bot.fetch_user(int(userid))
-                    dm_embed = discord.Embed(
-                        title="Your Pterodactyl Account",
-                        description=f"**Email**: {email}\n**Password**: {password}\n**Panel**: {ptero.ptero_url}",
-                        color=discord.Color.green()
-                    )
-                    try:
-                        await user.send(embed=dm_embed)
-                        await interaction.followup.send(f"Account created for {email}. Credentials sent to user ID {userid}.", ephemeral=True)
-                    except discord.Forbidden:
-                        await interaction.followup.send(f"Account created, but could not DM user ID {userid}.", ephemeral=True)
-                else:
-                    await interaction.followup.send(f"Failed to create account: {(await resp.json()).get('errors', 'Unknown error')}", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in createacc: {str(e)}")
-            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
-
-@tree.command(name="manage", description="Manage a server with buttons")
-@app_commands.describe(accountapikey="Pterodactyl client API key", email="Email to set permissions")
-async def manage(interaction: discord.Interaction, accountapikey: str, email: str):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer()
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Get user ID by email
-            async with session.get(f'{ptero.ptero_url}/api/application/users?filter[email]={email}', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200 or not (data := await resp.json())['data']:
-                    return await interaction.followup.send(f"No user found with email {email}.", ephemeral=True)
-                user_id = data['data'][0]['attributes']['id']
-
-            # Get server list for user
-            async with session.get(f'{ptero.ptero_url}/api/application/servers', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch servers.", ephemeral=True)
-                servers = [s for s in (await resp.json())['data'] if s['attributes']['user'] == user_id]
-                if not servers:
-                    return await interaction.followup.send(f"No servers found for {email}.", ephemeral=True)
-                server = servers[0]['attributes']  # Use first server for simplicity
-
-            # Get server status and resources
-            client_headers = {'Authorization': f'Bearer {accountapikey}', 'Accept': 'application/json'}
-            async with session.get(f'{ptero.ptero_url}/api/client/servers/{server["identifier"]}/resources', headers=client_headers) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch server status.", ephemeral=True)
-                resources = (await resp.json())['attributes']
-
-            # Create embed
-            status = "Online" if resources['current_state'] == 'running' else "Offline"
-            embed = discord.Embed(
-                title=f"Server: {server['name']}",
-                description=(
-                    f"**Status**: {status}\n"
-                    f"**RAM**: {resources['resources']['memory_bytes'] / 1_000_000_000:.2f}GB/{server['limits']['memory'] / 1000}GB\n"
-                    f"**CPU**: {resources['resources']['cpu_absolute']}%/{server['limits']['cpu']}%\n"
-                    f"**Disk**: {resources['resources']['disk_bytes'] / 1_000_000_000:.2f}GB/{server['limits']['disk'] / 1000}GB\n"
-                    f"**IP**: {server['allocation']['ip']}:{server['allocation']['port']}"
-                ),
-                color=discord.Color.green() if status == "Online" else discord.Color.red()
-            )
-
-            # Create buttons
-            view = discord.ui.View()
-            actions = [
-                ("Start", "start", discord.ButtonStyle.green),
-                ("Stop", "stop", discord.ButtonStyle.red),
-                ("Restart", "restart", discord.ButtonStyle.blurple),
-                ("Reinstall", "reinstall", discord.ButtonStyle.grey),
-                ("Reload", "reload", discord.ButtonStyle.grey)
-            ]
-            for label, action, style in actions:
-                async def button_callback(interaction: discord.Interaction, action=action):
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            f'{ptero.ptero_url}/api/client/servers/{server["identifier"]}/power',
-                            json={"signal": action},
-                            headers=client_headers
-                        ) as resp:
-                            if resp.status in (200, 204):
-                                await interaction.response.send_message(f"{action.capitalize()} command sent!", ephemeral=True)
-                            else:
-                                await interaction.response.send_message(f"Failed to {action} server.", ephemeral=True)
-                button = discord.ui.Button(label=label, style=style)
-                button.callback = button_callback
-                view.add_item(button)
-
-            # File management buttons (placeholder)
-            async def file_action(interaction: discord.Interaction, action):
-                await interaction.response.send_message(f"{action} file feature not implemented in this example.", ephemeral=True)
-            view.add_item(discord.ui.Button(label="Upload File", style=discord.ButtonStyle.grey, custom_id="upload_file", callback=lambda i: file_action(i, "Upload")))
-            view.add_item(discord.ui.Button(label="Delete File", style=discord.ButtonStyle.grey, custom_id="delete_file", callback=lambda i: file_action(i, "Delete")))
-
-            # Permissions button
-            async def set_permissions(interaction: discord.Interaction):
-                async with aiohttp.ClientSession() as session:
-                    async with session.patch(
-                        f'{ptero.ptero_url}/api/application/users/{user_id}',
-                        json={"admin": True},
-                        headers=await ptero.get_headers()
-                    ) as resp:
-                        if resp.status == 200:
-                            await interaction.response.send_message(f"Admin permissions set for {email}.", ephemeral=True)
-                        else:
-                            await interaction.response.send_message(f"Failed to set permissions.", ephemeral=True)
-            view.add_item(discord.ui.Button(label="Set Admin", style=discord.ButtonStyle.grey, custom_id="set_admin", callback=set_permissions))
-
-            await interaction.followup.send(embed=embed, view=view)
-
-@tree.command(name="nodes", description="Show Pterodactyl node status")
-async def nodes(interaction: discord.Interaction):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f'{ptero.ptero_url}/api/application/nodes', headers=await ptero.get_headers()) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send("Failed to fetch nodes.", ephemeral=True)
-                nodes = (await resp.json())['data']
-                embed = discord.Embed(title="Node Status", color=discord.Color.blue())
-                for node in nodes:
-                    attrs = node['attributes']
-                    status = "Online" if attrs['is_online'] else "Offline"
-                    embed.add_field(
-                        name=attrs['name'],
-                        value=(
-                            f"**Status**: {status}\n"
-                            f"**RAM**: {attrs['memory_used'] / 1_000_000_000:.2f}GB/{attrs['memory'] / 1_000_000_000}GB\n"
-                            f"**Disk**: {attrs['disk_used'] / 1_000_000_000:.2f}GB/{attrs['disk'] / 1_000_000_000}TB"
-                        ),
-                        inline=False
-                    )
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(label="Panel", url=ptero.ptero_url, style=discord.ButtonStyle.link))
-                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-        except Exception as e:
-            logger.error(f"Error in nodes: {str(e)}")
-            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
-
-@tree.command(name="addadmin_bot", description="Add a user as bot admin")
-@app_commands.describe(userid="Discord User ID to add as admin")
-async def addadmin_bot(interaction: discord.Interaction, userid: str):
-    if not await ptero.check_admin(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    try:
-        user = await bot.fetch_user(int(userid))
-        role = discord.utils.get(interaction.guild.roles, id=ptero.admin_role_id)
-        if role:
-            await user.add_roles(role)
-            await interaction.followup.send(f"User {user.name} added as bot admin!", ephemeral=True)
-        else:
-            await interaction.followup.send(f"Admin role ID {ptero.admin_role_id} not found.", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in addadmin_bot: {str(e)}")
-        await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
+# Slash admin check helper
+def is_admin_interaction(user: discord.User) -> bool:
+    return is_admin_raw(user.id)
 
 @bot.event
 async def on_ready():
-    logger.info(f'Logged in as {bot.user}')
     try:
-        synced = await tree.sync()
-        logger.info(f'Synced {len(synced)} command(s)')
-        if not synced:
-            logger.warning('No commands synced. Check configuration or permissions.')
+        await tree.sync()
+    except Exception:
+        pass
+    print(f"[READY] Logged in as {bot.user} ({bot.user.id})")
+
+# PREFIX COMMANDS (fallback)
+@bot.command(name="addadmin_bot")
+@commands.check(admin_check)
+async def addadmin_bot_prefix(ctx, userid: str):
+    added = add_admin_raw(int(userid))
+    if added:
+        await ctx.reply(f"Added {userid} to admin whitelist.")
+    else:
+        await ctx.reply(f"{userid} was already an admin.")
+
+@bot.command(name="create_acc")
+@commands.check(admin_check)
+async def create_acc_prefix(ctx, userid: str, email: str, password: str):
+    await ctx.reply("Creating account...", ephemeral=True)
+    try:
+        payload = {
+            "email": email,
+            "username": f"user{userid}",
+            "first_name": "User",
+            "last_name": userid,
+            "password": password,
+            "language": "en"
+        }
+        resp = await ptero_request("POST", "/users", json_body=payload)
+        # DM credentials
+        try:
+            member = await ctx.guild.fetch_member(int(userid))
+            await member.send(f"Account created.\nEmail: {email}\nPassword: {password}\nPanel: {PTERO_BASE}")
+            await ctx.reply(f"Created account and sent credentials to <@{userid}>.")
+        except Exception:
+            await ctx.reply(f"Account created. Credentials:\nEmail: {email}\nPassword: {password}\nPanel: {PTERO_BASE}")
     except Exception as e:
-        logger.error(f'Failed to sync commands: {str(e)}')
+        await ctx.reply(f"Failed to create account: {e}")
+
+@bot.command(name="create_server")
+@commands.check(admin_check)
+async def create_server_prefix(ctx, server_name: str, owner_email: str, cpu_limit: int, memory_mb: int, disk_mb: int):
+    await ctx.reply("Creating server...", ephemeral=True)
+    try:
+        users_resp = await ptero_request("GET", f"/users?filter[email]={owner_email}")
+        if not users_resp.get("data"):
+            await ctx.reply(f"No panel user with email {owner_email}.")
+            return
+        user_id = users_resp["data"][0]["attributes"]["id"]
+        # Replace nest/egg with your real IDs for Paper
+        server_payload = {
+            "name": server_name,
+            "user": user_id,
+            "nest": 1,  # <<-- placeholder
+            "egg": 7,   # <<-- placeholder for Paper egg
+            "docker_image": "ghcr.io/pterodactyl/yolks:java_17",
+            "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar paper.jar",
+            "limits": {
+                "memory": memory_mb,
+                "swap": 0,
+                "disk": disk_mb,
+                "io": 500,
+                "cpu": cpu_limit
+            },
+            "feature_limits": {
+                "databases": 1,
+                "allocations": 1
+            },
+            "environment": {
+                "PAPER_VERSION": "latest"
+            }
+        }
+        created = await ptero_request("POST", "/servers", json_body=server_payload)
+        identifier = created["attributes"]["identifier"]
+        await ctx.reply(f"Server created: {server_name} (ID: {identifier})")
+    except Exception as e:
+        await ctx.reply(f"Error: {e}")
+
+@bot.command(name="remove_server")
+@commands.check(admin_check)
+async def remove_server_prefix(ctx, serverid: str):
+    await ctx.reply(f"Deleting server {serverid}...", ephemeral=True)
+    try:
+        await ptero_request("DELETE", f"/servers/{serverid}")
+        await ctx.reply(f"Deleted server {serverid}.")
+    except Exception as e:
+        await ctx.reply(f"Failed to delete: {e}")
+
+@bot.command(name="check_server_list")
+@commands.check(admin_check)
+async def check_server_list_prefix(ctx):
+    await ctx.reply("Fetching server list...", ephemeral=True)
+    try:
+        resp = await ptero_request("GET", "/servers")
+        data = resp.get("data", [])
+        if not data:
+            await ctx.reply("No servers found.")
+            return
+        lines = []
+        for s in data[:25]:
+            a = s["attributes"]
+            lines.append(f"{a['name']} ({a['identifier']}) Owner: {a['user']}")
+        if len(data) > 25:
+            lines.append(f"...and {len(data)-25} more.")
+        await ctx.reply("\n".join(lines))
+    except Exception as e:
+        await ctx.reply(f"Error listing: {e}")
+
+@bot.command(name="nodes")
+@commands.check(admin_check)
+async def nodes_prefix(ctx):
+    await ctx.reply("Fetching nodes...", ephemeral=True)
+    try:
+        resp = await ptero_request("GET", "/nodes")
+        nodes = resp.get("data", [])
+        if not nodes:
+            await ctx.reply("No nodes.")
+            return
+        lines = []
+        for node in nodes:
+            a = node["attributes"]
+            name = a.get("name", "unknown")
+            memory = a.get("memory", 0)
+            disk = a.get("disk", 0)
+            status = "🟢 Online" if a.get("public", True) else "🔴 Offline"
+            lines.append(f"{name}: {memory}MB RAM • {disk}MB Disk • {status}")
+        await ctx.reply("\n".join(lines[:15]))
+    except Exception as e:
+        await ctx.reply(f"Error fetching nodes: {e}")
+
+# SLASH COMMANDS
+
+@tree.command(name="addadmin_bot", description="Add a discord user as admin for the bot.")
+@app_commands.describe(userid="Discord user ID to add as admin")
+async def addadmin_bot(interaction: Interaction, userid: str):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    added = add_admin_raw(int(userid))
+    if added:
+        await interaction.response.send_message(f"Added {userid} to admin list.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{userid} is already admin.", ephemeral=True)
+
+@tree.command(name="create_acc", description="Create Pterodactyl account and DM credentials (admin only).")
+@app_commands.describe(userid="Discord user ID to DM", email="Email for new account", password="Password to set")
+async def create_acc(interaction: Interaction, userid: str, email: str, password: str):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        payload = {
+            "email": email,
+            "username": f"user{userid}",
+            "first_name": "User",
+            "last_name": userid,
+            "password": password,
+            "language": "en"
+        }
+        resp = await ptero_request("POST", "/users", json_body=payload)
+        # DM the target
+        try:
+            guild = interaction.guild
+            member = await guild.fetch_member(int(userid))
+            dm = await member.create_dm()
+            await dm.send(f"Your panel account is created.\nEmail: {email}\nPassword: {password}\nPanel: {PTERO_BASE}")
+            await interaction.followup.send(f"Account created and credentials sent to <@{userid}>.", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(f"Account created. Credentials:\nEmail: {email}\nPassword: {password}\nPanel: {PTERO_BASE}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to create account: {e}", ephemeral=True)
+
+@tree.command(name="create_server", description="Create a Paper Minecraft server with limits (admin only).")
+@app_commands.describe(
+    server_name="Name of the server",
+    owner_email="Owner's panel email (must exist)",
+    cpu_limit="CPU limit (integer)",
+    memory_mb="Memory in MB",
+    disk_mb="Disk in MB"
+)
+async def create_server(interaction: Interaction, server_name: str, owner_email: str, cpu_limit: int, memory_mb: int, disk_mb: int):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        users_resp = await ptero_request("GET", f"/users?filter[email]={owner_email}")
+        if not users_resp.get("data"):
+            await interaction.followup.send_message(f"No user with email {owner_email}.", ephemeral=True)
+            return
+        user_id = users_resp["data"][0]["attributes"]["id"]
+        server_payload = {
+            "name": server_name,
+            "user": user_id,
+            # TODO: replace with actual nest/egg IDs corresponding to Paper
+            "nest": 1,  # placeholder
+            "egg": 7,   # placeholder for Paper egg
+            "docker_image": "ghcr.io/pterodactyl/yolks:java_17",
+            "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar paper.jar",
+            "limits": {
+                "memory": memory_mb,
+                "swap": 0,
+                "disk": disk_mb,
+                "io": 500,
+                "cpu": cpu_limit
+            },
+            "feature_limits": {
+                "databases": 1,
+                "allocations": 1
+            },
+            "environment": {
+                "PAPER_VERSION": "latest"
+            }
+        }
+        created = await ptero_request("POST", "/servers", json_body=server_payload)
+        identifier = created["attributes"]["identifier"]
+        await interaction.followup.send(f"Server '{server_name}' created with ID `{identifier}`.")
+    except Exception as e:
+        await interaction.followup.send(f"Error creating server: {e}")
+
+@tree.command(name="remove_server", description="Delete a server by identifier (admin only).")
+@app_commands.describe(serverid="Server identifier to delete")
+async def remove_server(interaction: Interaction, serverid: str):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        await ptero_request("DELETE", f"/servers/{serverid}")
+        await interaction.followup.send(f"Server {serverid} deleted.")
+    except Exception as e:
+        await interaction.followup.send(f"Failed to delete: {e}")
+
+@tree.command(name="check_server_list", description="List all servers (admin only).")
+async def check_server_list(interaction: Interaction):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        resp = await ptero_request("GET", "/servers")
+        data = resp.get("data", [])
+        if not data:
+            await interaction.followup.send("No servers found.")
+            return
+        lines = []
+        for s in data[:30]:
+            a = s["attributes"]
+            lines.append(f"{a['name']} ({a['identifier']}) Owner: {a['user']}")
+        if len(data) > 30:
+            lines.append(f"...and {len(data)-30} more.")
+        await interaction.followup.send("\n".join(lines))
+    except Exception as e:
+        await interaction.followup.send(f"Failed: {e}")
+
+# Manage view with controls
+class ManageView(ui.View):
+    def __init__(self, server_id: str):
+        super().__init__(timeout=180)
+        self.server_id = server_id
+
+    async def _send_power_signal(self, interaction: Interaction, signal: str, label: str):
+        await interaction.response.defer()
+        try:
+            await ptero_request("POST", f"/servers/{self.server_id}/power", json_body={"signal": signal})
+            await interaction.followup.send(f"{label} signal sent.")
+        except Exception as e:
+            await interaction.followup.send(f"Failed to {label.lower()}: {e}")
+
+    @ui.button(label="Start", style=discord.ButtonStyle.green, custom_id="manage_start")
+    async def start(self, interaction: Interaction, button: ui.Button):
+        await self._send_power_signal(interaction, "start", "Start")
+
+    @ui.button(label="Stop", style=discord.ButtonStyle.red, custom_id="manage_stop")
+    async def stop(self, interaction: Interaction, button: ui.Button):
+        await self._send_power_signal(interaction, "stop", "Stop")
+
+    @ui.button(label="Restart", style=discord.ButtonStyle.blurple, custom_id="manage_restart")
+    async def restart(self, interaction: Interaction, button: ui.Button):
+        await self._send_power_signal(interaction, "restart", "Restart")
+
+    @ui.button(label="Reinstall", style=discord.ButtonStyle.gray, custom_id="manage_reinstall")
+    async def reinstall(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.defer()
+        try:
+            await ptero_request("POST", f"/servers/{self.server_id}/reinstall")
+            await interaction.followup.send("Reinstall triggered.")
+        except Exception as e:
+            await interaction.followup.send(f"Failed to reinstall: {e}")
+
+    @ui.button(label="IP Info", style=discord.ButtonStyle.secondary, custom_id="manage_ipinfo")
+    async def ipinfo(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.defer()
+        try:
+            server = await ptero_request("GET", f"/servers/{self.server_id}")
+            allocs = server["attributes"]["relationships"]["allocations"]["data"]
+            if not allocs:
+                await interaction.followup.send("No allocation found.")
+                return
+            first = allocs[0]["attributes"]
+            ip = first.get("ip", "unknown")
+            port = first.get("port", "unknown")
+            await interaction.followup.send(f"IP: {ip}:{port}")
+        except Exception as e:
+            await interaction.followup.send(f"Failed to fetch IP info: {e}")
+
+@tree.command(name="manage", description="Manage a given server (admin only).")
+@app_commands.describe(serverid="Server identifier to manage")
+async def manage(interaction: Interaction, serverid: str):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        server = await ptero_request("GET", f"/servers/{serverid}")
+        attr = server["attributes"]
+        status = attr.get("status", "unknown")
+        resources = format_resources(attr)
+        online = "🟢 Online" if status == "running" else "🔴 Offline"
+        embed = discord.Embed(title=f"Manage Server: {attr.get('name','unknown')}",
+                              color=0x00FF00 if status == "running" else 0xFF0000)
+        embed.add_field(name="Status", value=online, inline=False)
+        embed.add_field(name="Resources", value=resources, inline=False)
+        owner = attr.get("user", "unknown")
+        embed.add_field(name="Owner ID", value=str(owner), inline=True)
+        view = ManageView(serverid)
+        await interaction.followup.send(embed=embed, view=view)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to fetch server: {e}")
+
+@tree.command(name="nodes", description="Show Pterodactyl node statuses (admin only).")
+async def nodes(interaction: Interaction):
+    if not is_admin_interaction(interaction.user):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        resp = await ptero_request("GET", "/nodes")
+        data = resp.get("data", [])
+        if not data:
+            await interaction.followup.send("No nodes.")
+            return
+        lines = []
+        for node in data:
+            a = node["attributes"]
+            name = a.get("name", "unknown")
+            memory = a.get("memory", 0)
+            disk = a.get("disk", 0)
+            status = "🟢 Online" if a.get("public", True) else "🔴 Offline"
+            lines.append(f"{name}: {memory}MB RAM • {disk}MB Disk • {status}")
+        await interaction.followup.send("\n".join(lines[:25]))
+    except Exception as e:
+        await interaction.followup.send(f"Failed to fetch nodes: {e}")
+
+# Global error handlers
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.reply("Unauthorized or missing admin permission.")
+    else:
+        await ctx.reply(f"Error: {error}")
 
 bot.run(DISCORD_TOKEN)
